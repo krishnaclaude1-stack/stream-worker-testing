@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 REM Determine arguments (use defaults if none provided)
 if "%~1"=="" (
-    set ARGS=Shathika --tor-streams 12 --times 800 --target 500 --tally-each
+    set ARGS="Lakshmi Priya" Jason Muniyammal --tor-streams 12 --times 800 --target 500 --tally-each
 ) else (
     set "ARGS=%*"
 )

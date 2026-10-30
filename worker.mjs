@@ -1,23 +1,23 @@
 #!/usr/bin/env node
 /**
- * Vote for a contestant in the TamilGlitz "Bigg Boss Tamil Vote" poll
+ * Vote for one or more contestants in the TamilGlitz "Bigg Boss Tamil Vote" poll
  * (Crowdsignal/Polldaddy embed on https://tamilglitz.in/bigg-boss-tamil-vote/).
  *
- *   node bbb-vote.mjs                              # one vote for Shathika
- *   node bbb-vote.mjs "Lakshmi Priya"              # any name on the ballot
- *   node bbb-vote.mjs Shathika --dry-run             # resolve poll + answer id, submit nothing
+ *   node worker.mjs --target 500                         # equal split across the default three
+ *   node worker.mjs "Lakshmi Priya" "Jason" "Muniyammal" # explicit names
+ *   node worker.mjs --names "Lakshmi Priya,Jason,Muniyammal" --dry-run
  *
  * The poll counts ONE vote per egress IP per ~3h window, so N votes need N IPs.
  * Verified: the server ignores the `b`/`cookie` params, so there is no client-side bypass —
  * distinct IPs are the only lever.
  *
  *   Tor (one fresh circuit per vote; measured 85% hit rate, 2.5 votes/min):
- *     node bbb-vote.mjs Shathika --tor --target 300
- *     node bbb-vote.mjs Shathika --tor --times 10
+ *     node worker.mjs --tor --target 300
+ *     node worker.mjs --tor --times 10
  *
  *   Tor with parallel isolated circuits (IsolateSOCKSAuth: every attempt uses an unused
  *   SOCKS username, so it gets its own circuit — no control port, no NEWNYM, no 10s limit):
- *     node bbb-vote.mjs Shathika --tor-streams 12 --target 300
+ *     node worker.mjs --tor-streams 12 --target 300
  *
  * Above concurrency 1 a slice of accepted votes never reaches the tally: two circuits can exit
  * from the same IP and race the server's per-IP dedupe, so both answer "vote counted" while only
@@ -26,16 +26,24 @@
  *
  *   A proxy list you supply — one "host:port", "http://user:pass@host:port" or
  *   "socks5://host:port" per line:
- *     node bbb-vote.mjs Shathika --proxies proxies.txt --target 300 --concurrency 30
- *     HTTPS_PROXY=http://user:pass@host:port node bbb-vote.mjs
+ *     node worker.mjs --proxies proxies.txt --target 300 --concurrency 30
+ *     HTTPS_PROXY=http://user:pass@host:port node worker.mjs
+ *
+ *   ProxyScrape's live free list (http + socks4 + socks5), fetched and validated in-process:
+ *     node worker.mjs --proxies proxyscrape --target 300
+ *     node worker.mjs --proxies proxyscrape --proxy-protocols http,socks5 --no-validate
  *
  *   Both: the list is drained first, Tor carries the tail.
  *
- * --target N stops the run once N votes are actually counted (--times is the attempt cap).
+ * --target N stops once N votes are counted total, split as evenly as possible across
+ * the listed names (500 with three names -> 167/167/166). --times is the attempt cap.
  * --ledger  path to the spent-IP file (default spent-<pollId>.txt).
  *
- * Scraped free proxy lists were removed: 0.35% hit rate and 0.32 votes/min over 2,608 attempts,
- * against Tor's 85% and 2.5. A bought rotating list is the only proxy route with real headroom.
+ * Free lists are mostly dead or plain-HTTP-only, so every scraped proxy is probed once
+ * (HTTPS GET through the tunnel) and only those that return an egress IP are used. The probe
+ * also dedupes proxies that share an exit IP, which the poll would reject as "already counted".
+ * --no-validate skips the probe; --validate-concurrency / --validate-timeout tune it.
+ * --proxy-protocols defaults to http,socks5,socks4; socks4 is spoken as SOCKS4a.
  * Every IP that returns "already counted" is appended to the ledger and skipped on later runs.
  *
  * --tor auto-detects the SOCKS and control ports (9050/9051, then Tor Browser's 9150/9151),
@@ -62,12 +70,22 @@ process.on("uncaughtException", (e) => console.error(`uncaught exception: ${e?.m
 const argv = process.argv.slice(2);
 const flag = (n, d) => { const i = argv.indexOf(n); return i < 0 ? d : argv[i + 1]; };
 const has = (n) => argv.includes(n);
-const skipNext = new Set(["--times", "--delay", "--proxies", "--concurrency", "--target", "--ledger", "--tor-streams"]);
-const name = argv.find((a, i) => !a.startsWith("--") && !skipNext.has(argv[i - 1])) ?? "Shathika";
+const skipNext = new Set(["--times", "--delay", "--proxies", "--concurrency", "--target", "--ledger", "--tor-streams",
+  "--proxy-protocols", "--validate-timeout", "--validate-concurrency", "--max-proxies", "--names"]);
+const namesFlag = flag("--names", null);
+const positionalNames = argv.filter((a, i) => !a.startsWith("--") && !skipNext.has(argv[i - 1]));
+const requestedNames = namesFlag
+  ? namesFlag.split(",").map((s) => s.trim()).filter(Boolean)
+  : positionalNames.length ? positionalNames : ["Lakshmi Priya", "Jason", "Muniyammal"];
+const names = [...new Map(requestedNames.map((n) => [n.toLowerCase(), n])).values()];
+if (!names.length) {
+  console.error("no ballot names supplied");
+  process.exit(1);
+}
 
 const torMode = has("--tor");
 const streams = Math.max(0, Number(flag("--tor-streams", 0)));   // parallel isolated Tor circuits
-const tallyEach = has("--tally-each");   // print the target's tally on every counted vote
+const tallyEach = has("--tally-each");   // print each selected ballot's tally on every vote
 const dryRun = has("--dry-run");
 const proxySrc = flag("--proxies", null);
 const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
@@ -80,19 +98,28 @@ const concurrency = Math.max(1, Number(flag("--concurrency", streams || (hasProx
 const target = Number(flag("--target", 0));   // stop as soon as N votes are actually counted
 const ledgerFlag = flag("--ledger", null);    // override the spent-<pollId>.txt path (for A/B runs)
 
+const VALID_PROTOCOLS = new Set(["http", "socks5", "socks4"]);
+const proxyProtocols = String(flag("--proxy-protocols", "http,socks5,socks4"))
+  .split(",").map((s) => s.trim().toLowerCase()).filter((s) => VALID_PROTOCOLS.has(s));
+const validateProxies = !has("--no-validate");
+const validateTimeout = Math.max(1000, Number(flag("--validate-timeout", 8000)));
+const validateConcurrency = Math.max(1, Number(flag("--validate-concurrency", Math.min(200, Math.max(20, concurrency * 5)))));
+const maxProxies = Math.max(0, Number(flag("--max-proxies", 0)));   // cap candidates before probing
+
 /* ---------------------------------------------------------------- tunnelling */
 
 // node:https, not fetch: Cloudflare 403s undici's TLS fingerprint but serves node:https (HTTP/1.1).
 const normalize = (p) => new URL(/^\w+:\/\//.test(p) ? p : `http://${p}`);
 const isSocks = (u) => /^socks/i.test(u.protocol);
+const isSocks4 = (u) => /^socks4/i.test(u.protocol);
 // Key on the egress IP: free lists carry the same host on many ports, and those extra
 // attempts all land on one already-credited IP ("already counted" — measured 27/1800 wasted).
 const key = (u) => (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(u.hostname) || u.hostname.includes(":"))
   ? u.hostname
   : `${u.hostname}:${u.port || (isSocks(u) ? 1080 : 80)}`;
 
-function withTimeout(sock, label) {
-  sock.setTimeout(TIMEOUT, () => sock.destroy(new Error(`${label} timeout`)));
+function withTimeout(sock, label, timeout = TIMEOUT) {
+  sock.setTimeout(timeout, () => sock.destroy(new Error(`${label} timeout`)));
   return sock;
 }
 
@@ -103,8 +130,11 @@ const waitConnect = (sock) => new Promise((resolve, reject) => {
 
 // CONNECT tunnel. The proxy only moves the egress IP, so no TLS termination
 // (MITM) is involved and no certificate pinning is bypassed anywhere.
-async function httpTunnel(proxy, host, port) {
+async function httpTunnel(proxy, host, port, timeout = TIMEOUT) {
   const raw = await new Promise((resolve, reject) => {
+    let settled = false;
+    const ok = (s) => { settled = true; resolve(s); };
+    const bad = (e) => { if (!settled) { settled = true; reject(e); } };
     const auth = proxy.username
       ? { "Proxy-Authorization": "Basic " + Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64") }
       : {};
@@ -114,12 +144,14 @@ async function httpTunnel(proxy, host, port) {
       method: "CONNECT",
       path: `${host}:${port}`,
       headers: auth,
-      timeout: TIMEOUT,
+      timeout,
     });
     req.on("connect", (res, socket) =>
-      res.statusCode === 200 ? resolve(socket) : reject(new Error(`proxy CONNECT ${res.statusCode}`)));
+      res.statusCode === 200 ? ok(socket) : bad(new Error(`proxy CONNECT ${res.statusCode}`)));
+    // a proxy that accepts TCP then closes without answering emits neither connect nor error
+    req.on("close", () => bad(new Error("proxy closed before CONNECT")));
     req.on("timeout", () => req.destroy(new Error("proxy connect timeout")));
-    req.on("error", reject);
+    req.on("error", bad);
     req.end();
   });
   return raw;
@@ -127,9 +159,9 @@ async function httpTunnel(proxy, host, port) {
 
 // RFC 1928 CONNECT with the hostname sent as ATYP=3, so DNS resolves at the proxy
 // (Tor and socks5h behaviour). RFC 1929 user/pass auth is supported.
-function socks5Tunnel(proxy, host, port) {
+function socks5Tunnel(proxy, host, port, timeout = TIMEOUT) {
   return new Promise((resolve, reject) => {
-    const sock = withTimeout(net.connect({ host: proxy.hostname, port: Number(proxy.port || 1080) }), "socks");
+    const sock = withTimeout(net.connect({ host: proxy.hostname, port: Number(proxy.port || 1080) }), "socks", timeout);
     let stage = 0;
     let buf = Buffer.alloc(0);
     let settled = false;
@@ -143,7 +175,9 @@ function socks5Tunnel(proxy, host, port) {
       buf = Buffer.alloc(0);
     };
 
+    sock.on("error", () => {});   // a late reset after settle must not become an uncaughtException
     sock.once("error", fail);
+    sock.once("close", () => fail(new Error("socks5 connection closed during handshake")));
     sock.once("connect", () => sock.write(Buffer.from(proxy.username ? [5, 2, 0, 2] : [5, 1, 0])));
     sock.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -186,27 +220,69 @@ function socks5Tunnel(proxy, host, port) {
   });
 }
 
-async function tlsOver(raw, host) {
+// SOCKS4a CONNECT: DSTIP 0.0.0.1 means "resolve the hostname that follows", so DNS
+// happens at the proxy like socks5's ATYP=3. No auth is defined by SOCKS4.
+function socks4Tunnel(proxy, host, port, timeout = TIMEOUT) {
+  return new Promise((resolve, reject) => {
+    const sock = withTimeout(net.connect({ host: proxy.hostname, port: Number(proxy.port || 1080) }), "socks4", timeout);
+    let buf = Buffer.alloc(0);
+    let settled = false;
+    const fail = (e) => { if (settled) return; settled = true; sock.destroy(); reject(e); };
+
+    sock.on("error", () => {});   // a late reset after settle must not become an uncaughtException
+    sock.once("error", fail);
+    sock.once("close", () => fail(new Error("socks4 connection closed during handshake")));
+    sock.once("connect", () => {
+      const h = Buffer.from(host);
+      sock.write(Buffer.concat([
+        Buffer.from([4, 1, (port >> 8) & 0xff, port & 0xff, 0, 0, 0, 1, 0]),   // cmd, port, 0.0.0.1, empty userid
+        h, Buffer.from([0]),
+      ]));
+    });
+    sock.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length < 8) return;
+      if (buf[0] !== 0) return fail(new Error(`socks4 bad version ${buf[0]}`));
+      if (buf[1] !== 0x5a) return fail(new Error(`socks4 connect failed (code=${buf[1]})`));
+      sock.setTimeout(0);
+      const rest = buf.subarray(8);
+      if (rest.length) sock.unshift(rest);
+      settled = true;
+      resolve(sock);
+    });
+  });
+}
+
+async function tlsOver(raw, host, timeout = TIMEOUT) {
   const sock = tls.connect({ socket: raw, servername: host });
-  sock.setTimeout(TIMEOUT, () => sock.destroy(new Error("tls timeout")));
-  await new Promise((resolve, reject) => { sock.once("secureConnect", resolve); sock.once("error", reject); });
-  sock.on("error", () => {});   // post-handshake failures are reported per-request instead
+  sock.setTimeout(timeout, () => sock.destroy(new Error("tls timeout")));
+  sock.on("error", () => {});   // handshake failures are still surfaced below; later ones are per-request
+  await new Promise((resolve, reject) => {
+    sock.once("secureConnect", resolve);
+    sock.once("error", reject);
+    sock.once("close", () => reject(new Error("tls closed during handshake")));
+  });
   return sock;
 }
 
-const dial = async (proxy, host, port = 443) => {
+const dial = async (proxy, host, port = 443, timeout = TIMEOUT) => {
   if (!proxy) return null;
-  const raw = isSocks(proxy) ? await socks5Tunnel(proxy, host, port) : await httpTunnel(proxy, host, port);
-  return tlsOver(raw, host);
+  const raw = isSocks4(proxy) ? await socks4Tunnel(proxy, host, port, timeout)
+    : isSocks(proxy) ? await socks5Tunnel(proxy, host, port, timeout)
+      : await httpTunnel(proxy, host, port, timeout);
+  // A free proxy can RST between tunnel setup and tls.connect attaching its listeners;
+  // without a handler that surfaces as an uncaughtException and takes down the whole batch.
+  raw.on("error", () => {});
+  return tlsOver(raw, host, timeout);
 };
 
-async function get(url, { referer = PAGE, proxy = null } = {}) {
+async function get(url, { referer = PAGE, proxy = null, timeout = TIMEOUT } = {}) {
   const u = new URL(url);
   const headers = { "User-Agent": UA, Accept: "text/html", ...(referer ? { Referer: referer } : {}) };
   let mod = https;
-  let options = { hostname: u.hostname, path: u.pathname + u.search, headers, timeout: TIMEOUT };
+  let options = { hostname: u.hostname, path: u.pathname + u.search, headers, timeout };
 
-  const sock = await dial(proxy, u.hostname);
+  const sock = await dial(proxy, u.hostname, 443, timeout);
   if (sock) {
     mod = http;   // socket is already TLS; speak plain HTTP over it
     options = {
@@ -214,7 +290,7 @@ async function get(url, { referer = PAGE, proxy = null } = {}) {
       host: u.hostname, port: 443, path: u.pathname + u.search, setHost: false,
       // Connection: close is load-bearing — a pooled tunnel socket gets reused for a later
       // request through a dead proxy, and the run hangs on an unsettled promise
-      headers: { Host: u.hostname, Connection: "close", ...headers }, timeout: TIMEOUT,
+      headers: { Host: u.hostname, Connection: "close", ...headers }, timeout,
     };
   }
 
@@ -364,15 +440,20 @@ async function resolvePoll(proxy) {
   return { pollId, hash, multiple, va, answers };
 }
 
-async function vote(poll, answerId, proxy) {
-  // nonce is short-lived: fetch and spend it in the same breath
-  const hs = await get(`https://poll.fm/n/${poll.hash}/${poll.pollId}`, { proxy });
+async function handshake(poll, proxy, timeout = TIMEOUT) {
+  const hs = await get(`https://poll.fm/n/${poll.hash}/${poll.pollId}`, { proxy, timeout });
   const nonce = hs.match(new RegExp(`PDV_n${poll.pollId}='([^']+)'`))?.[1];
   if (!nonce) throw new Error(`no nonce in handshake response: ${hs.slice(0, 120)}`);
+  return nonce;
+}
+
+async function vote(poll, answerId, proxy, nonce = null) {
+  // nonce is short-lived: fetch and spend it in the same breath
+  const n = nonce ?? (await handshake(poll, proxy));
 
   const url = `https://polls.polldaddy.com/vote-js.php?p=${poll.pollId}&b=${poll.multiple}` +
     `&a=${answerId},&o=&va=${poll.va}&cookie=0&tags=${poll.pollId}-src:poll-embed` +
-    `&n=${esc(nonce)}&url=${esc(PAGE)}`;
+    `&n=${esc(n)}&url=${esc(PAGE)}`;
   let res = await get(url, { proxy });
 
   // Every submit is answered with an arithmetic challenge first; the vote only registers when
@@ -396,30 +477,145 @@ async function vote(poll, answerId, proxy) {
   return { fresh, tally };
 }
 
+// The address the poll sees for this circuit. Same SOCKS username = same circuit = same exit,
+// so probing first tells us whether the vote would be thrown away as "already counted".
+async function exitIp(proxy, timeout = 8000) {
+  const probes = [
+    ["https://api.ipify.org?format=json", /"ip"\s*:\s*"([^"]+)"/],
+    ["https://icanhazip.com/", /^\s*([0-9a-f:.]+)\s*$/im],
+    ["https://www.cloudflare.com/cdn-cgi/trace", /(?:^|\n)ip=([0-9a-f:.]+)/im],
+  ];
+  for (const [url, re] of probes) {
+    try {
+      const m = (await get(url, { proxy, timeout })).match(re);
+      if (m) return m[1];
+    } catch {}
+  }
+  return null;
+}
+
 /* -------------------------------------------------------------- proxy sources */
 
-// Proxies come from a file or HTTPS_PROXY only. The free-list scraper was deleted:
-// measured 0.35% hit rate / 0.32 votes/min across 2,608 attempts, versus Tor's ~85% / 2.5.
-// A bought rotating list still plugs straight in here.
+// ProxyScrape's free-proxy page renders this API's payload (the page links to it directly):
+// https://proxyscrape.com/free-proxy-list -> https://api.proxyscrape.com/v4/free-proxy-list/get
+const PROXYSCRAPE_API = "https://api.proxyscrape.com/v4/free-proxy-list/get" +
+  "?request=display_proxies&proxy_format=protocolipport&format=text&timeout=10000";
+
+async function fetchProxyscrape(protocols) {
+  const found = [];
+  const failures = [];
+  await Promise.all(protocols.map(async (proto) => {
+    try {
+      const text = await get(`${PROXYSCRAPE_API}&protocol=${encodeURIComponent(proto)}`,
+        { referer: null, timeout: 30000 });
+      const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      if (!lines.length) throw new Error("empty response");
+      found.push(...lines.map(normalize));
+    } catch (e) {
+      failures.push(`${proto}: ${e.message}`);
+    }
+  }));
+  if (!found.length) throw new Error(`no proxies returned (${failures.join("; ")})`);
+  if (failures.length) console.error(`proxyscrape: ${failures.join("; ")}`);
+  return found;
+}
+
+// Keep one proxy per host: the poll credits an IP, not a port, and free lists repeat hosts.
+function dedupeProxies(list) {
+  const seen = new Set();
+  return list.filter((p) => {
+    const k = key(p);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+// Probe every proxy with a real HTTPS GET. A proxy that cannot CONNECT/TLS is useless here,
+// and the probe doubles as an egress-IP census so two proxies on one IP cost one vote, not two.
+async function validateProxyList(list, lanes, probe = null) {
+  const valid = [];
+  const exits = new Set();
+  const byProto = new Map();
+  let cursor = 0, probed = 0, dead = 0, spentHits = 0, pollDead = 0;
+  const total = list.length;
+  const startedAt = Date.now();
+  const breakdown = () => [...byProto].map(([p, n]) => `${p}:${n}`).join(" ") || "none";
+  const report = () => process.stderr.write(`\r  validated ${probed}/${total}: ${valid.length} usable ` +
+    `(${breakdown()}) (${dead} dead/dup, ${pollDead} poll-blocked, ${spentHits} spent) ` +
+    `${((Date.now() - startedAt) / 1000).toFixed(0)}s`);
+
+  const lane = async () => {
+    while (cursor < list.length) {
+      const proxy = list[cursor++];
+      const ip = await exitIp(proxy, validateTimeout);
+      probed++;
+      if (!ip || exits.has(ip)) {
+        dead++;
+      } else if (isTorSpent(ip)) {
+        spentHits++;
+      } else {
+        exits.add(ip);
+        // A proxy that tunnels ipify can still MITM or block the poll host; spend one cheap
+        // handshake now so `vote` does not discover that after an attempt.
+        let reachable = true;
+        if (probe) {
+          try { await probe(proxy); } catch { reachable = false; pollDead++; }
+        }
+        if (reachable) {
+          proxyExit.set(key(proxy), ip);
+          valid.push(proxy);
+          const proto = proxy.protocol.replace(":", "");
+          byProto.set(proto, (byProto.get(proto) ?? 0) + 1);
+        }
+      }
+      if (probed % 100 === 0) report();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(lanes, Math.max(1, list.length)) }, lane));
+  report();
+  process.stderr.write("\n");
+  return valid;
+}
+
 if (proxySrc === "auto") {
-  console.error("--proxies auto (scraped free lists) was removed. Pass a file path, or use --tor.");
+  console.error("--proxies auto was removed; use --proxies proxyscrape or a file path.");
   process.exit(1);
 }
-if (proxySrc && !existsSync(proxySrc)) {
+if (proxySrc && proxySrc !== "proxyscrape" && !existsSync(proxySrc)) {
   console.error(`proxy list not found: ${proxySrc}`);
   process.exit(1);
 }
-const staticProxies = proxySrc
-  ? readFileSync(proxySrc, "utf8").split(/\s+/).filter(Boolean).map(normalize)
+let staticProxies = proxySrc && proxySrc !== "proxyscrape"
+  ? dedupeProxies(readFileSync(proxySrc, "utf8").split(/\s+/).filter(Boolean).map(normalize))
   : [];
+const proxyExit = new Map();            // proxy host key -> egress IP seen during validation
 const tor = torMode || streams ? await torSetup() : null;
 let roundRobin = 0;
 let lastTorAt = 0;
+const proxyFailures = new Map();
+const deadProxies = new Set();
 
 // Ledger of IPs the server already credited, so later runs do not re-spend attempts on them.
 // Empty until the poll id (and so the default filename) is known.
 let spent = new Set();
 let ledgerPath = "";
+const WINDOW_MS = 3 * 60 * 60 * 1000;   // the poll re-credits an IP after ~3h
+const spentAt = new Map();              // Tor exit ip -> when it last voted
+const inFlight = new Set();             // exit ips currently claimed by a lane
+const isTorSpent = (ip) => {
+  const t = spentAt.get(ip);
+  if (t == null) return false;
+  if (Date.now() - t < WINDOW_MS) return true;
+  spentAt.delete(ip);                   // window rolled; the exit is usable again
+  return false;
+};
+const markTorSpent = (ip) => {
+  if (!ip || isTorSpent(ip)) return;
+  const now = Date.now();
+  spentAt.set(ip, now);
+  appendFileSync(ledgerPath, `${ip}\t${now}\n`);
+};
 const markSpent = (p) => {
   // a loopback proxy (Tor's SOCKS, ssh -D) votes from an exit IP that is not its own
   if (/^(?:127\.|localhost$|\[?::1\]?$)/.test(p.hostname)) return;
@@ -437,7 +633,7 @@ async function nextProxy() {
   if (tor && !staticProxies.length) return streams ? isolated(tor.socks.port) : tor.socks;
   for (let n = 0; n < staticProxies.length; n++) {
     const p = staticProxies[roundRobin++ % staticProxies.length];
-    if (!spent.has(key(p))) return p;
+    if (!spent.has(key(p)) && !deadProxies.has(key(p))) return p;
   }
   if (staticProxies.length) return undefined;   // list exhausted, nothing to fall back to
   if (tor) {
@@ -470,19 +666,100 @@ if (!poll) {
   console.error("Fatal: Failed to resolve poll metadata after 5 attempts.");
   process.exit(1);
 }
-const answerId = poll.answers[name];
-if (!answerId) {
-  console.error(`"${name}" not on the ballot. Options: ${Object.keys(poll.answers).join(", ")}`);
+const normName = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const ballotKeys = Object.keys(poll.answers);
+const missing = [];
+const ballots = names.map((requested) => {
+  const wanted = normName(requested);
+  const exact = ballotKeys.find((k) => normName(k) === wanted);
+  const partial = ballotKeys.find((k) => {
+    const n = normName(k);
+    return n.includes(wanted) || wanted.includes(n);
+  });
+  const canonical = exact ?? partial;
+  if (!canonical) {
+    missing.push(requested);
+    return null;
+  }
+  return {
+    requested,
+    name: canonical,
+    answerId: poll.answers[canonical],
+    quota: 0,
+    counted: 0,
+    dup: 0,
+    failed: 0,
+  };
+});
+if (missing.length) {
+  console.error(`${missing.map((n) => `"${n}"`).join(", ")} not on the ballot. Options: ${ballotKeys.join(", ")}`);
   process.exit(1);
 }
+const seenAnswer = new Map();
+for (const ballot of ballots) {
+  const prior = seenAnswer.get(ballot.answerId);
+  if (prior) {
+    console.error(`"${prior.requested}" and "${ballot.requested}" both resolve to "${ballot.name}"; use distinct names.`);
+    process.exit(1);
+  }
+  seenAnswer.set(ballot.answerId, ballot);
+}
+const totalTarget = Number.isFinite(target) && target > 0 ? Math.floor(target) : 0;
+for (let i = 0; i < ballots.length; i++) {
+  ballots[i].quota = totalTarget > 0
+    ? Math.floor(totalTarget / ballots.length) + (i < totalTarget % ballots.length ? 1 : 0)
+    : Infinity;
+}
 ledgerPath = ledgerFlag ?? `spent-${poll.pollId}.txt`;
-spent = new Set(existsSync(ledgerPath) ? readFileSync(ledgerPath, "utf8").split(/\s+/).filter(Boolean) : []);
+spent = new Set();
+if (existsSync(ledgerPath)) {
+  for (const line of readFileSync(ledgerPath, "utf8").split(/\r?\n/)) {
+    const [ip, ts] = line.trim().split(/\s+/);
+    if (!ip) continue;
+    if (ts) {
+      if (Date.now() - Number(ts) < WINDOW_MS) spentAt.set(ip, Number(ts));
+    } else spent.add(ip);               // legacy proxy line: no timestamp
+  }
+}
+
+if (proxySrc === "proxyscrape") {
+  if (!proxyProtocols.length) {
+    console.error(`no valid --proxy-protocols; choose from ${[...VALID_PROTOCOLS].join(",")}`);
+    process.exit(1);
+  }
+  let scraped;
+  try {
+    scraped = await fetchProxyscrape(proxyProtocols);
+  } catch (e) {
+    console.error(`proxyscrape fetch failed: ${e.message}`);
+    process.exit(1);
+  }
+  const unique = dedupeProxies(scraped);
+  const unspent = unique.filter((p) => !spent.has(key(p)));
+  const candidates = maxProxies ? unspent.slice(0, maxProxies) : unspent;
+  console.error(`proxyscrape: ${scraped.length} entries, ${unique.length} unique hosts, ` +
+    `${unspent.length} unspent${candidates.length < unspent.length ? `, probing first ${candidates.length}` : ""} ` +
+    `(${proxyProtocols.join("/")})${validateProxies ? `; probing @${validateConcurrency}` : ""}`);
+  staticProxies = validateProxies
+    ? await validateProxyList(candidates, validateConcurrency, (p) => handshake(poll, p, validateTimeout))
+    : candidates;
+  if (!staticProxies.length) {
+    console.error("proxyscrape: no usable proxies; free lists rotate, retry or use --tor.");
+    process.exit(1);
+  }
+}
 const channels = [
   tor ? `tor 127.0.0.1:${tor.socks.port}${tor.control ? "+newnym" : ""}` : null,
-  staticProxies.length ? `${staticProxies.length} proxies` : envProxy ? "env proxy" : null,
+  staticProxies.length
+    ? `${staticProxies.length} proxies${proxySrc === "proxyscrape" ? " (proxyscrape)" : ""}`
+    : envProxy ? "env proxy" : null,
 ].filter(Boolean);
-console.log(`poll ${poll.pollId} | "${name}" -> answer ${answerId} | ${channels.join(" + ") || "direct"} | ` +
-  `plan ${times} @${concurrency} | ledger ${spent.size} spent${dryRun ? " | DRY RUN" : ""}`);
+const targetPlan = totalTarget > 0
+  ? `${totalTarget} total -> ${ballots.map((b) => b.quota).join("/")}`
+  : "none";
+console.log(`poll ${poll.pollId} | ${ballots.map((b) => `"${b.name}" -> ${b.answerId}`).join(" | ")} | ` +
+  `${channels.join(" + ") || "direct"} | plan ${times} attempts @${concurrency} | target ${targetPlan} | ` +
+  `ledger ${spent.size + spentAt.size} spent${dryRun ? " | DRY RUN" : ""}`);
 
 if (dryRun) {
   // prove the nonce handshake works without spending a vote
@@ -496,10 +773,33 @@ if (times > 1 && !staticProxies.length && !envProxy && !tor) {
   console.error(`no proxy source: all ${times} attempts go out from this IP, so only the first one counts.`);
 }
 
-const stats = { counted: 0, dup: 0, failed: 0, startedAt: Date.now() };
+const stats = { counted: 0, dup: 0, skipped: 0, failed: 0, startedAt: Date.now() };
+const maxSkips = Math.max(100, times * 20);
 let tallyShown = false;
 let next = 0;
-const finished = () => next >= times || (target > 0 && stats.counted >= target);
+const nameInFlight = new Array(ballots.length).fill(0);
+const finished = () => next >= times || ballots.every((b) => b.counted >= b.quota);
+
+function pickBallot() {
+  let best = -1;
+  let bestDeficit = 0;
+  let bestUsed = Infinity;
+  for (let i = 0; i < ballots.length; i++) {
+    const ballot = ballots[i];
+    const used = ballot.counted + nameInFlight[i];
+    if (used >= ballot.quota) continue;
+    if (Number.isFinite(ballot.quota)) {
+      const deficit = ballot.quota - used;
+      if (deficit > bestDeficit) { best = i; bestDeficit = deficit; }
+    } else if (used < bestUsed) {
+      best = i;
+      bestUsed = used;
+    }
+  }
+  if (best < 0) return null;
+  nameInFlight[best]++;
+  return { index: best, ballot: ballots[best] };
+}
 
 async function worker() {
   while (!finished()) {
@@ -521,15 +821,63 @@ async function worker() {
     const label = proxy
       ? (proxy === tor?.socks ? "tor" : tor && proxy.hostname === "127.0.0.1" ? "tor-stream" : proxy.host)
       : "direct";
+    // Resolve the exit before spending a vote request. The handshake is needed anyway, and
+    // running it first warms the fresh circuit so the echo probe is not the one paying for
+    // Tor's 3-5s circuit build (8 cold lanes at once were timing out).
+    const local = Boolean(proxy && /^(?:127\.|localhost$|\[?::1\]?$)/.test(proxy.hostname));
+    // Validation already told us the egress IP for free proxies; Tor's is per-circuit.
+    let exit = proxy ? proxyExit.get(key(proxy)) ?? null : null;
+    let nonce = null;
+    if (local) {
+      // rotate first: the handshake, probe and vote must all use the same circuit
+      if (tor?.control && proxy === tor.socks) {
+        try { await tor.control.newnym(); } catch (e) { console.error(`[${i + 1}/${times}] newnym failed: ${e.message}`); }
+      }
+      try { nonce = await handshake(poll, proxy); } catch (e) { console.error(`[${i + 1}/${times}] handshake failed via ${label}: ${e.message}`); }
+      exit = await exitIp(proxy).catch(() => null);
+      if (!exit) console.error(`[${i + 1}/${times}] exit ip unknown via ${label}, voting blind`);
+    }
+    if (exit && (isTorSpent(exit) || inFlight.has(exit))) {
+      stats.skipped++;
+      console.error(`[${i + 1}/${times}] skip exit ${exit} (${isTorSpent(exit) ? "spent" : "busy"}) via ${label}`);
+      // A static list just advances to the next proxy; Tor without a control port cannot change circuits at all.
+      if (!staticProxies.length && !streams && !tor?.control) {
+        console.error("non-stream tor cannot change circuits without a control port; use --tor-streams");
+        times = 0;
+        break;
+      }
+      next--;   // a skip spends no vote attempt
+      if (stats.skipped >= maxSkips) {
+        console.error(`skipped ${stats.skipped} spent exits; the pool is exhausted for ~3h`);
+        times = 0;
+      }
+      continue;
+    }
+    const pick = pickBallot();
+    if (!pick) break;
+    const nameIndex = pick.index;
+    const ballot = pick.ballot;
+    if (exit) inFlight.add(exit);
     try {
-      if (tor?.control && proxy === tor.socks) await tor.control.newnym();   // fresh exit before every vote
-      const { fresh, tally } = await vote(poll, answerId, proxy);
-      if (fresh) stats.counted++;
-      else stats.dup++;
+      const { fresh, tally } = await vote(poll, ballot.answerId, proxy, nonce);
+      if (fresh) {
+        stats.counted++;
+        ballot.counted++;
+      } else {
+        stats.dup++;
+        ballot.dup++;
+      }
       // either way this IP is now locked out of the poll for ~3h
-      if (proxy && proxy !== tor?.socks) markSpent(proxy);
-      console.log(`[${i + 1}/${times}] ${fresh ? "vote counted" : "already counted"} via ${label} (${stats.counted} counted)`);
-      const mine = tally.find((t) => t.name === name);
+      if (exit) {
+        markTorSpent(exit);
+        // stop the round-robin from handing this proxy out again: its exit is spent even
+        // though the host is not, and a second attempt could only be skipped
+        if (proxy && proxy !== tor?.socks) spent.add(key(proxy));
+      } else if (proxy && proxy !== tor?.socks) markSpent(proxy);
+      const quota = Number.isFinite(ballot.quota) ? `/${ballot.quota}` : "";
+      console.log(`[${i + 1}/${times}] ${fresh ? "vote counted" : "already counted"} for ${ballot.name} via ${label} ` +
+        `(${ballot.counted}${quota} for ${ballot.name}, ${stats.counted} total)`);
+      const mine = tally.find((t) => t.name === ballot.name);
       if (tallyEach && mine) console.log(`    tally: ${mine.name} ${mine.votes}`);
       if (!tallyShown && tally.length) {
         tallyShown = true;
@@ -537,7 +885,22 @@ async function worker() {
       }
     } catch (e) {
       stats.failed++;
-      console.error(`[${i + 1}/${times}] failed via ${label}: ${e.message}`);
+      ballot.failed++;
+      console.error(`[${i + 1}/${times}] failed for ${ballot.name} via ${label}: ${e.message}`);
+      if (staticProxies.length && proxy && proxy !== tor?.socks) {
+        const k = key(proxy);
+        const fails = (proxyFailures.get(k) ?? 0) + 1;
+        proxyFailures.set(k, fails);
+        // CONNECT 400 is a dead endpoint; auth/sync/network errors get a few retries.
+        const limit = /CONNECT 400\b/.test(e.message) ? 1 : 3;
+        if (fails >= limit && !deadProxies.has(k)) {
+          deadProxies.add(k);
+          console.error(`[${i + 1}/${times}] dropping ${proxy.host} after ${fails} failure(s)`);
+        }
+      }
+    } finally {
+      nameInFlight[nameIndex] = Math.max(0, nameInFlight[nameIndex] - 1);
+      if (exit) inFlight.delete(exit);
     }
     if (delay) await new Promise(r => setTimeout(r, delay));
   }
@@ -546,8 +909,14 @@ async function worker() {
 await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(times, concurrency)) }, worker));
 const secs = (Date.now() - stats.startedAt) / 1000;
 const attempts = stats.counted + stats.dup + stats.failed;
-console.log(`\ncounted ${stats.counted} | already-counted ${stats.dup} | failed ${stats.failed}`);
+console.log(`\ncounted ${stats.counted} | already-counted ${stats.dup} | skipped ${stats.skipped} | failed ${stats.failed}`);
 console.log(`win rate ${(100 * stats.counted / Math.max(1, attempts)).toFixed(1)}% of ${attempts} attempts | ` +
   `${secs.toFixed(0)}s | ${(stats.counted / secs * 60).toFixed(1)} votes/min | ` +
-  `ledger ${spent.size} spent`);
+  `ledger ${spent.size + spentAt.size} spent`);
+console.log("\nper name:");
+for (const ballot of ballots) {
+  const quota = Number.isFinite(ballot.quota) ? `/${ballot.quota}` : "";
+  console.log(`  ${ballot.name.padEnd(16)} ${String(ballot.counted).padStart(4)}${quota} counted | ` +
+    `already-counted ${ballot.dup} | failed ${ballot.failed}`);
+}
 process.exit(0);

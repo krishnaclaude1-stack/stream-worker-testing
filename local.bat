@@ -59,8 +59,8 @@ call :ensure_tor
 if errorlevel 1 goto fatal
 
 echo.
-echo [%TIME%] voting: Shathiga --tor-streams 12 --target 500 --times 2000
-node worker.mjs Shathiga --tor-streams 12 --target 500 --times 2000 --tally-each
+echo [%TIME%] voting: "Lakshmi Priya" Jason Muniyammal --tor-streams 12 --target 500 --times 2000
+node worker.mjs "Lakshmi Priya" Jason Muniyammal --tor-streams 12 --target 500 --times 2000 --tally-each
 echo [%TIME%] cycle finished; restarting in 3s ^(Ctrl+C to stop^)
 ping -n 4 127.0.0.1 >nul
 goto loop

@@ -74,7 +74,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 $nodeArgs = if ($ArgsList -and $ArgsList.Count -gt 0) {
     $ArgsList
 } else {
-    @("Shathika", "--tor-streams", "12", "--times", "800", "--target", "500", "--tally-each")
+    @("Lakshmi Priya", "Jason", "Muniyammal", "--tor-streams", "12", "--times", "800", "--target", "500", "--tally-each")
 }
 
 Write-Host "=== Bigg Boss Tamil Voting Automation ===" -ForegroundColor Cyan
