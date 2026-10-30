@@ -3,7 +3,18 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 
 const PORT = Number(process.env.PORT || 3000);
-const CONTESTANT = process.env.VOTE_CONTESTANT || process.env.CONTESTANT || "Shathiga";
+const DEFAULT_CONTESTANTS = ["Lakshmi Priya", "Jason", "Muniyammal"];
+const CONTESTANTS = String(process.env.VOTE_CONTESTANTS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (!CONTESTANTS.length) CONTESTANTS.push(...DEFAULT_CONTESTANTS);
+const CONTESTANT = CONTESTANTS.join(", ");
+const TARGET_NAMES = CONTESTANTS.map((n) => n.toLowerCase());
+const isTargetName = (name) => {
+  const n = name.toLowerCase();
+  return TARGET_NAMES.some((t) => n.includes(t) || t.includes(n));
+};
 const TOR_STREAMS = process.env.TOR_STREAMS || "12";
 const BATCH_TIMES = process.env.BATCH_TIMES || "2000";
 const BATCH_TARGET = process.env.BATCH_TARGET || "500";
@@ -79,27 +90,29 @@ function parseOutputLine(line) {
   log(trimmed, logType);
 
   // Check for successful vote
-  const countedMatch = trimmed.match(/\[(\d+)\/(\d+)\]\s+vote counted via\s+(\S+)\s+\((\d+)\s+counted\)/i);
+  const countedMatch = trimmed.match(/\[(\d+)\/(\d+)\]\s+vote counted/i);
   if (countedMatch) {
-    state.batchCounted = Number(countedMatch[4]);
+    const total = trimmed.match(/,\s*(\d+)\s+total\)\s*$/i)?.[1]
+      ?? trimmed.match(/\((\d+)\s+counted\)\s*$/i)?.[1];
+    state.batchCounted = total ? Number(total) : state.batchCounted + 1;
     state.totalCounted++;
     state.lastVoteTime = new Date().toLocaleTimeString();
     return;
   }
 
   // Duplicate / already counted
-  if (/already counted via/i.test(trimmed)) {
+  if (/already counted.*via/i.test(trimmed)) {
     state.totalDuplicates++;
     return;
   }
 
   // Failed vote
-  if (/failed via/i.test(trimmed)) {
+  if (/failed.*via/i.test(trimmed)) {
     state.totalFailed++;
     return;
   }
 
-  // Candidate tally single line: "tally: Shathika 12,345"
+  // Candidate tally single line: "tally: Lakshmi 12,345"
   const singleTally = trimmed.match(/tally:\s+([A-Za-z0-9 .'-]+?)\s+([\d,]+)/i);
   if (singleTally) {
     const name = singleTally[1].trim();
@@ -108,18 +121,18 @@ function parseOutputLine(line) {
     if (existing) {
       existing.votes = votes;
     } else {
-      state.pollStandings.push({ name, votes, pct: "—", isTarget: name.toLowerCase().includes(CONTESTANT.toLowerCase()) });
+      state.pollStandings.push({ name, votes, pct: "—", isTarget: isTargetName(name) });
     }
     return;
   }
 
-  // Table row: "  Shathika          34.5%  14,210"
+  // Table row: "  Lakshmi          34.5%  14,210"
   const tableMatch = trimmed.match(/^([A-Za-z0-9 .'-]+?)\s{2,}([\d.]+)%\s+([\d,]+)/);
   if (tableMatch) {
     const name = tableMatch[1].trim();
     const pct = tableMatch[2].trim();
     const votes = tableMatch[3].trim();
-    const isTarget = name.toLowerCase().includes(CONTESTANT.toLowerCase());
+    const isTarget = isTargetName(name);
 
     const idx = state.pollStandings.findIndex((s) => s.name.toLowerCase() === name.toLowerCase());
     const item = { name, pct, votes, isTarget };
@@ -163,7 +176,7 @@ async function runVotingSupervisor() {
 
     const args = [
       "worker.mjs",
-      CONTESTANT,
+      ...CONTESTANTS,
       "--tor-streams", TOR_STREAMS,
       "--times", BATCH_TIMES,
       "--target", BATCH_TARGET,
